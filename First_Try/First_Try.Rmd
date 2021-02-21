@@ -9,22 +9,352 @@ output: pdf_document
 knitr::opts_chunk$set(echo = TRUE)
 ```
 
-## R Markdown
+### Packages
+```{r}
+require(mlr3)
 
-This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+require(survivalsvm)
 
-When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
-
-```{r cars}
-summary(cars)
+# For survivalsvm learner
+require(remotes)
+remotes::install_github("mlr-org/mlr3extralearners")
+require(mlr3extralearners)
+install_learners("surv.svm")
 ```
 
-## Including Plots
 
-You can also embed plots, for example:
 
-```{r pressure, echo=FALSE}
-plot(pressure)
+## Data 
+
+```{r}
+train_data <- readRDS("../Data/train_data.Rds")
 ```
 
-Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+
+# Dataset 1 (d1) and regression
+
+```{r}
+d1 <- train_data$d1
+#d1$V4 <- as.character(d1$V4)
+d1 <- subset(d1, select = -V4)
+```
+
+
+
+## Task Creation 
+
+Create a new task for a survival task object. 
+```{r}
+task_d1 <-
+  mlr3proba::TaskSurv$new(
+    id = "d1",
+    backend = d1,
+    time = "time",
+    event = "status"
+  )
+
+
+print(task_d1)
+head(task_d1$truth())
+```
+
+Graphical summary of the tasks properties by plotting the task
+```{r}
+require(mlr3viz)
+
+autoplot(task_d1) #too many features
+```
+
+Some functions
+```{r}
+task_d1$nrow
+task_d1$ncol
+
+head(task_d1$row_ids)
+
+task_d1$data(rows = c(1,5,10))
+
+task_d1$feature_names
+
+task_d1$feature_types
+
+task_d1$target_names
+
+task_d1$data(rows = c(1,5,10), cols = "V10")
+
+summary(as.data.table(task_d1))
+
+print(task_d1$col_roles)
+
+# task_d1$set_col_roles("V1", roles = "name")
+```
+The learner can apparently not handle factor variables, so we need to transform the factor variable into character. Maybe we can do that in the data processing part, right before creating the task.
+
+
+
+## Learners
+Basic Learner
+```{r}
+learner <- mlr_learners$get("surv.svm")
+print(learner)
+
+learner$param_set
+
+#learner$param_set$values = list(cp = 0.01, xval = 0) # das funktioniert nicht so richtig
+```
+
+Set parameters for different types and hyperparameters
+
+
+Let´s start with regression:
+```{r}
+# learner$param_set$values = list(type = "regression", gamma.mu = 0.1) das funktioniert nicht so richtig
+
+svm_regression = lrn("surv.svm", type = "regression", gamma.mu = 5, opt.meth = "ipop")
+```
+
+
+
+
+## Train and Predict
+
+Set training and test dataset
+```{r}
+train_set = sample(task_d1$nrow, 0.8 * task_d1$nrow)
+test_set = setdiff(seq_len(task_d1$nrow), train_set)
+```
+
+Training the learner
+```{r}
+svm_regression$model
+
+svm_regression$train(task_d1, row_ids = train_set)
+
+print(svm_regression$model)
+```
+
+The learner can apparently not handle factor variables, so we need to transform the factor variable into character. Maybe we can do that in the data processing part, right before creating the task.
+
+Character does also not work. What to do with this now :/
+
+
+## Prediction
+
+```{r}
+prediction_d1 <- svm_regression$predict(task_d1, row_ids = test_set)
+
+print(prediction_d1)
+```
+
+
+
+
+## Measuring the accuracy
+
+'surv.mae' / 'surv.maeSE' / 'surv.mse'
+
+```{r}
+prediction_d1$score(msr("surv.cindex"))
+# prediction_d1$score(msr("surv.brier")) # if this is the IBS, then not really possible for regression at least
+```
+
+
+
+
+# Benchmarking
+
+Let´s find best performance for different types of SurvivalSVM
+
+
+## Linear Kernel
+
+```{r}
+design_lin = benchmark_grid(
+  tasks = task_d1,
+  learners = list(
+    lrn(
+      "surv.svm",
+      type = "regression",
+      gamma.mu = 0.1,
+      kernel = "lin_kernel"
+    ),
+    lrn(
+      "surv.svm",
+      type = "vanbelle1",
+      gamma.mu = 0.1,
+      kernel = "lin_kernel", 
+      diff.meth = "makediff3"
+    ),
+    lrn(
+      "surv.svm",
+      type = "hybrid",
+      gamma.mu = c(0.1,0.2),
+      kernel = "lin_kernel",
+      diff.meth = "makediff3"
+    )
+  ),
+  resamplings = rsmp("holdout")
+)
+
+print(design_lin)
+```
+
+
+Execute benchmark
+```{r}
+CI <- list()
+
+bmr_lin = benchmark(design_lin)
+
+bmr_lin$aggregate(msr("surv.cindex"))
+
+
+CI[["Linear_Kernel"]] <- bmr_lin$aggregate(msr("surv.cindex"))
+```
+
+
+
+## Additive Kernel
+
+
+```{r}
+design_add = benchmark_grid(
+  tasks = task_d1,
+  learners = list(
+    lrn(
+      "surv.svm",
+      type = "regression",
+      gamma.mu = 0.1,
+      kernel = "add_kernel"
+    ),
+    lrn(
+      "surv.svm",
+      type = "vanbelle1",
+      gamma.mu = 0.1,
+      kernel = "add_kernel", 
+      diff.meth = "makediff3"
+    ),
+    lrn(
+      "surv.svm",
+      type = "hybrid",
+      gamma.mu = c(0.1,0.2),
+      kernel = "add_kernel",
+      diff.meth = "makediff3"
+    )
+  ),
+  resamplings = rsmp("cv")
+)
+
+print(design_add)
+```
+
+
+Execute benchmark
+```{r}
+bmr_add = benchmark(design_add)
+
+bmr_add$aggregate(msr("surv.cindex"))
+
+CI[["Additive_Kernel"]] <- bmr_add$aggregate(msr("surv.cindex"))
+```
+
+
+
+
+## RBF Kernel
+
+```{r}
+design_rbf = benchmark_grid(
+  tasks = task_d1,
+  learners = list(
+    lrn(
+      "surv.svm",
+      type = "regression",
+      gamma.mu = 0.1,
+      kernel = "rbf_kernel"
+    ),
+    lrn(
+      "surv.svm",
+      type = "vanbelle1",
+      gamma.mu = 0.1,
+      kernel = "rbf_kernel", 
+      diff.meth = "makediff3"
+    ),
+    lrn(
+      "surv.svm",
+      type = "hybrid",
+      gamma.mu = c(0.1,0.2),
+      kernel = "rbf_kernel",
+      diff.meth = "makediff3"
+    )
+  ),
+  resamplings = rsmp("holdout")
+)
+
+print(design_rbf)
+```
+
+
+Execute benchmark
+```{r}
+bmr_rbf = benchmark(design_rbf)
+
+bmr_rbf$aggregate(msr("surv.cindex"))
+
+CI[["RBF_Kernel"]] <- bmr_rbf$aggregate(msr("surv.cindex"))
+```
+
+
+
+
+## Polynomial Kernel
+
+```{r}
+design_poly = benchmark_grid(
+  tasks = task_d1,
+  learners = list(
+    lrn(
+      "surv.svm",
+      type = "regression",
+      gamma.mu = 0.1,
+      kernel = "poly_kernel"
+    ),
+    lrn(
+      "surv.svm",
+      type = "vanbelle1",
+      gamma.mu = 0.1,
+      kernel = "poly_kernel", 
+      diff.meth = "makediff3"
+    ),
+    lrn(
+      "surv.svm",
+      type = "hybrid",
+      gamma.mu = c(0.1,0.2),
+      kernel = "poly_kernel",
+      diff.meth = "makediff3"
+    )
+  ),
+  resamplings = rsmp("holdout")
+)
+
+print(design_poly)
+```
+
+
+Execute benchmark
+```{r}
+bmr_poly = benchmark(design_poly)
+
+bmr_poly$aggregate(msr("surv.cindex"))
+
+CI[["Polynomial_Kernel"]] <- bmr_poly$aggregate(msr("surv.cindex"))
+```
+
+
+## Plot
+
+```{r}
+autoplot(bmr_add)
+```
+

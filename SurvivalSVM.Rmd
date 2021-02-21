@@ -1,0 +1,268 @@
+---
+title: "survivalsvm in mlr3"
+author: "Sarah Musiol"
+date: "20/02/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+### Required packages
+```{r}
+require(mlr3)
+require(mlr3tuning)
+require(mlr3viz)
+require(mlr3pipelines)
+require(survivalsvm)
+require(paradox)
+
+require(remotes)
+#remotes::install_github("mlr-org/mlr3extralearners")
+require(mlr3extralearners)
+#install_learners("surv.svm")
+
+require(progressr)
+
+```
+
+
+## Data Preprocessing
+
+Let´s first load the data. 
+```{r}
+train_data <- readRDS("../Data/train_data.Rds")
+```
+
+
+### Setup tasks
+
+We will also need to set up tasks for our learner.
+
+```{r}
+tasks <- list()
+
+for(d in names(train_data)) {
+  
+  tasks[[d]] <- mlr3proba::TaskSurv$new(
+    id = d,
+    backend = train_data[[d]],
+    time = "time",
+    event = "status"
+  )
+  
+}
+```
+
+
+
+Apparently mlr3 has a problem dealing with character/factor variables. I am not familiar with other methods used in this scenario. Nevertheless, survivalsvm on its own does not show any errors and seems to be dealing fine with factor variables. 
+Since the mlr3 package is fairly new to me, I am not sure why this problem occurs. 
+The package \texttt{fastDummies} contains a function \texttt{dummy_cols} which does create dummy coded variables. A design matrix seems to have solved the issue. Unfortunately, the function is not yet fully optimized and does not account for multicollinearity. Optimization procedures in \texttt{survivalsvm} cannot handle multicollinearity. 
+Therefore, I discussed with my supervisor and there is still the possibility to use pipelines. 
+Not only to deal with factor variables, but also to deal with missing values. Although I want to hold back for a while with missing values to discover how survivalsvm can handle those and how the performance can be approved with imputing. 
+Imputation will be done with the mean column value. If there will be more time available, I might consider imputation using \texttt{mice}.
+
+
+### Pipeline for factor variables
+Let´s start with a pipeline for factor variables. The only one found is the modelmatrix one. That one also exists in baseR. Let´s see how it works in PipeOp:
+
+Setting up the pipeline.
+```{r}
+pop = po("modelmatrix", formula = ~ .  -1)
+```
+
+Let´s see how it looks like for the first dataset:
+```{r}
+tasks[["d1"]]$data()
+pop$train(list(tasks[["d1"]]))[[1]]
+```
+
+Seems to work very fine. Let´s apply pop to each task.
+```{r, eval = FALSE}
+for(d in names(tasks)) {
+  
+  try(
+  tasks[[d]] <- pop$train(list(tasks[[d]]))[[1]]
+  )
+  
+}
+```
+
+Dataset d7 does not work somehow. Alright, apparently d7 is the only dataset with missing values. However, tasks have no problem dealing with missing values. The problem seems to be modelmatrix (as well as dummy_cols).
+It seems I will have to build a pipeline which is first going to impute the missing values in d7 before I build model matrices. 
+
+
+
+### Pipeline for missing data
+
+Since the median is more robust for outliers, let´s impute missing values with the median. In view of limited time, I will take the disadvantages of this imputation technique into account and will consider better methods when there will be more time. 
+Let´s create a pipeline which first imputes missing values and builds a modelmatrix afterwards. 
+```{r, eval = FALSE}
+impute_pop <-
+  po("imputesample") %>>% po("imputemedian") %>>% po("modelmatrix", formula = ~ .  - 1)
+
+impute_pop$train(tasks[["d7"]])[[1]]
+```
+
+```{r}
+for(d in names(tasks)) {
+  
+  tasks[[d]] <- impute_pop$train(tasks[[d]])[[1]]
+  
+}
+```
+
+It works!! 
+
+
+
+
+
+## Setup Autotuner
+
+Now that the data preprocessing is done, let´s focus on setting up a Autotuner in order to get a descent learner for our data. 
+
+### Preliminary Settings
+
+Let´s first select a search algorithm. To keep this algorithm rather easy for now, let´s select random search. 
+Due to running time, let´s keep the number of evaluations at 10. 
+```{r}
+random_tuner = mlr3tuning::tnr("random_search")
+terminator = mlr3tuning::trm("evals", n_evals = 10)
+```
+
+
+The performance measure according to which the learner will be tuned, is going to be the c-index. Unfortunately, the Integrated-Brier Score is based on survival estimates which survivalsvm does not support. 
+Evaluating the final learner with the same performance measure tends to overfit the data. 
+Perhaps, another pipeline might be build for that? Let´s leave this task to the end.
+```{r}
+c_index <- mlr3::msr("surv.cindex")
+IBS <- mlr3::msr("surv.graf")
+```
+
+
+The resampling strategy is going to be k-fold cross-validation. Setting k=5. The number will be increased as soon as the working algorithm stands.
+```{r}
+rsmp_tuner = rsmp("cv", folds = 5)
+```
+
+
+
+### Setup Learner
+
+As mentioned in the eralier presentation, we focused on three different models regarding survival SVMs, the support vector regression, the ranking approach and the combination of both, the hybrid approach. As we compared these different approaches, it was apparent that the hybrid approach got the best predictions whereas the ranking approach was the fastest. Since we are interested in the best predictions, we are going to focus on the hybrid approach. 
+While I compared all methods in a small scale, all of them resulted in very similar c-indices. Therefore, it seems appropriate to choose the hybrid approach. 
+(Even though I might have been mistaken, I need to check that once again.)
+
+
+```{r}
+svm <- mlr3::lrn("surv.svm",
+            type = "hybrid",
+            gamma.mu = c(0.1, 0.1),
+            diff.meth = "makediff3",
+            opt.meth = "ipop")
+```
+
+
+The problem that arises with the hybrid approach is the regularization parameter. Since the hybrid approach is a combination of the SVR and the ranking approach, it consists of two regularization parameters. These are mandatory in the function. 
+While defining the parameter search space, a vector has to be considered. This makes it a bit tricky. That is something I will have to find out.
+Although nowhere stated, I hope the margin parameter is actually the parameter defining the violations allowed for support vectors. This parameter is only used in the ipop optimization method, therefore we choose ipop for optimization. 
+
+```{r}
+params = paradox::ParamSet$new(
+  list(
+    ParamDbl$new("gamma.mu", lower = 0L, upper = 5L, default = 0.1),
+    ParamDbl$new("margin", lower = 0L, upper = 1L),
+    ParamFct$new("kernel", levels = c("lin_kernel", "add_kernel", "rbf_kernel"))
+  )
+)
+```
+
+
+With all these information the autotuner can be set up:
+```{r}
+svm_tuner = mlr3tuning::AutoTuner$new(
+  learner      = svm,
+  resampling   = rsmp_tuner,
+  measure      = c_index,
+  search_space = params,
+  tuner        = random_tuner,
+  terminator   = terminator
+)
+```
+
+
+
+
+## Benchmark Anlysis 
+
+Finally, the learner can be tuned by a benchmark analysis. We are going to compare the cox-PH model and the kaplan-meier estimator. If our learner is worse than the kaplan-meier estimator, something went terribly wrong. The hope is to achieve at least results as good as the cox-PH model. 
+
+```{r}
+coxph <- mlr3::lrn("surv.coxph")
+kaplan <- mlr3::lrn("surv.kaplan")
+
+learners <- list(svm_tuner, coxph, kaplan)
+```
+
+
+Let´s then define the grid for the benchmark. Again, we chose 5-fold cross-validation.
+
+```{r}
+rsmp_benchmark <- mlr3::rsmp("cv", folds = 5)
+
+grd = mlr3::benchmark_grid(
+  task = tasks,
+  learner = learners, 
+  resampling = rsmp_benchmark
+)
+```
+
+
+Making use of parallelization, we can run our benchmark. Unfortunately, I realized I only have a Dual-Core Processor. Time to upgrade my hardware. 
+```{r, cache = TRUE}
+  future::plan("multisession", workers = 2)
+  progressr::with_progress(bmr <- benchmark(grd))
+  saveRDS(bmr, "../Data/bmr_csv.RDS")
+```
+
+Well, also when using modelmatrix we have the problem with singular computation, meaning linearly dependent columns. The function survivalsvm does not have a problem with that. Also, not all iterations give that error. Therefore, mlr3 does something inbetween the iterations that makes the data linearly dependent. 
+In Regression one column is used as the reference. As it seems that does not happen here. However, I am not sure yet, if I can just remove the first column of the dummy variables. 
+Maybe the contrasts argument can help with that problem, but I also do not quite understand yet what it actually does...
+Btw., the hybrid approach does have an issue with the regularization parameters, that I haven´t worked out yet. Therefore, I am trying to figure out these issues with the regression and ranking approach. 
+
+REMARK: d3 works well and it contains factor variables. Possibly the linearly independent columns have the same entries for different factor variables, e.g. females were treated with method 1 or something similar.
+
+
+
+## Results
+
+Let´s visualize our results on our datasets. 
+Since we evaluate on the c-index there might be a lot of discriminant. We might have overfit our data. As mentioned, SVMs do not support survival estimates, therefore a evaluation on the IBS is a bit harder.
+
+```{r}
+bmr$aggregate(c_index)
+#bmr$aggregate(IBS)
+
+mlr3viz::autoplot(bmr, measure = c_index)
+
+bmr$resample_results$resample_result
+bmr$learners$learner[[3]]
+```
+
+
+Since nothing else is working, let´s work on that pipeline for IBS:
+```{r}
+pipe_IBS <- ppl(
+  "distrcompositor",
+  learner = bmr$learners$learner[[1]],
+  estimator = "kaplan",
+  form = "ph"
+)
+
+train_IBS <- pipe_IBS$train(tasks[["d3"]])
+train_IBS
+```
+compose_distr. has no solution: NULL 

@@ -1,0 +1,261 @@
+---
+title: "Outline"
+author: "Sarah Musiol"
+date: "25/01/2021"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE,
+  eval = FALSE,
+  cache = TRUE,
+  error = FALSE,
+  warning = FALSE
+)
+```
+
+
+# Benchmark Analysis on Survival SVM
+
+\underline{Problem:} Factor nor character variables can be processed in the training of the model. 
+
+Temporary solution: Delete these variables from the dataset. 
+Idea: Create a design matrix out of the dataset
+
+
+## Packages needed for this analysis
+```{r, error=FALSE, warning=FALSE}
+require(mlr3)
+require(mlr3tuning)
+
+require(survivalsvm)
+
+require(paradox)
+
+# For survivalsvm learner
+require(remotes)
+remotes::install_github("mlr-org/mlr3extralearners")
+require(mlr3extralearners)
+install_learners("surv.svm")
+
+# For Visualization
+require(mlr3viz)
+
+
+require(progressr)
+
+require(fastDummies)
+
+require(skimr)
+```
+
+
+## Get the data
+```{r}
+train_data <- readRDS("../Data/train_data.Rds")
+```
+
+
+Check if problem exists in plain survivalsvm function 
+```{r}
+svm_reg <-
+  survivalsvm(
+    formula = Surv(time, status) ~ .,
+    data = tasks[["d1"]],
+    type = "regression",
+    gamma.mu = 0.1
+  )
+```
+It seems to be working in survivalsvm
+
+
+## Create Tasks for each dataset
+```{r}
+tasks <- list()
+
+for(d in names(train_data)) {
+  
+  tasks[[d]] <- mlr3proba::TaskSurv$new(
+    id = d,
+    backend = train_data[[d]],
+    time = "time",
+    event = "status"
+  )
+  
+}
+
+skimr::skim(tasks$data())
+```
+
+
+
+Problem: Factor/Character Variable
+```{r, eval = FALSE}
+train_data$d1 <- subset(train_data$d1, select = -V4)
+
+d1 <- contrasts()
+
+tasks <-
+  mlr3proba::TaskSurv$new(
+    id = "d1",
+    backend = d1,
+    time = "time",
+    event = "status"
+  )
+```
+
+
+Graphical summary of the tasks properties by plotting each task.
+```{r, eval = FALSE}
+par(mfrow = c(2,4))
+
+
+autoplot(tasks[[1]])
+autoplot(tasks[[2]])
+autoplot(tasks[[3]])
+autoplot(tasks[[4]])
+autoplot(tasks[[5]])
+autoplot(tasks[[6]])
+autoplot(tasks[[7]])
+autoplot(tasks[[8]])
+```
+
+
+
+## Setup Autotuner
+
+Define a search algorithm: random search with 10 evaluations
+Does that make sense?
+```{r}
+random_tuner = mlr3tuning::tnr("random_search")
+terminator = mlr3tuning::trm("evals", n_evals = 10)
+```
+
+Define performance measure
+```{r}
+c_index <- mlr3::msr("surv.cindex")
+IBS <- mlr3::msr("surv.graf")
+```
+
+Resampling strategy: 5-fold CV
+```{r}
+rsmp_tuner = rsmp("cv", folds = 5)
+```
+
+
+### Setup Learners 
+
+Define learner
+```{r}
+svr =
+  mlr3::lrn("surv.svm",
+            type = "regression",
+            gamma.mu = 0.1,
+            opt.meth = "ipop")
+
+svm =
+  mlr3::lrn("surv.svm",
+            type = "vanbelle1",
+            gamma.mu = 0.1,
+            diff.meth = "makediff3",
+            opt.meth = "ipop")
+
+svm_hybrid =
+  mlr3::lrn("surv.svm",
+            type = "hybrid",
+            gamma.mu = c(0.1, 0.5),
+            diff.meth = "makediff3",
+            opt.meth = "ipop")
+```
+
+
+Define Paramater Space
+```{r}
+params = paradox::ParamSet$new(
+  list(
+    ParamDbl$new("gamma.mu", lower = 0L, upper = 5L, default = 0.1),
+    ParamDbl$new("margin", lower = 0L, upper = 1L),
+    ParamFct$new("kernel", levels = c("lin_kernel", "add_kernel", "rbf_kernel"))
+  )
+)
+```
+
+Setup Autotuner
+```{r}
+svr_tuner = mlr3tuning::AutoTuner$new(
+  learner      = svr,
+  resampling   = rsmp_tuner,
+  measure      = c_index,
+  search_space = params,
+  tuner        = random_tuner,
+  terminator   = terminator
+)
+
+svm_tuner = mlr3tuning::AutoTuner$new(
+  learner      = svm,
+  resampling   = rsmp_tuner,
+  measure      = c_index,
+  search_space = params,
+  tuner        = random_tuner,
+  terminator   = terminator
+)
+
+svm_hybrid_tuner = mlr3tuning::AutoTuner$new(
+  learner      = svm_hybrid,
+  resampling   = rsmp_tuner,
+  measure      = c_index,
+  search_space = params,
+  tuner        = random_tuner,
+  terminator   = terminator
+)
+```
+
+
+
+## Benchmark
+
+Define list of learners
+```{r}
+coxph <- mlr3::lrn("surv.coxph")
+kaplan <- mlr3::lrn("surv.kaplan")
+
+learners <- list(svr_tuner, svm_tuner)
+```
+
+Define a benchmark grid.
+```{r}
+rsmp_benchmark <- mlr3::rsmp("cv", folds = 5)
+
+grd = mlr3::benchmark_grid(
+  task = tasks[["d3"]],
+  learner = learners, 
+  resampling = rsmp_benchmark
+)
+```
+
+Run the benchmark
+```{r, cache = TRUE}
+  future::plan("multisession", workers = 1)
+  progressr::with_progress(bmr <- benchmark(grd))
+  saveRDS(bmr, "../Data/bmr_cv.RDS")
+```
+
+
+
+## Results 
+Evaluate results
+```{r}
+#bmr$aggregate(IBS)
+bmr$aggregate(c_index)
+bmr$aggregate(IBS)
+
+mlr3viz::autoplot(bmr, measure = c_index)
+
+bmr$resample_results$resample_result
+bmr$learners$learner[[1]]
+```
+
+
+
+
