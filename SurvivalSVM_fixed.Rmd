@@ -1,0 +1,345 @@
+---
+title: "Survival Support Vector Machines"
+author: "Sarah Musiol"
+date: "01/03/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+# Required packages
+```{r}
+require(mlr3)
+require(mlr3tuning)
+require(mlr3viz)
+require(mlr3pipelines)
+require(mlr3filters)
+require(survivalsvm)
+require(paradox)
+
+require(remotes)
+#remotes::install_github("mlr-org/mlr3extralearners")
+require(mlr3extralearners)
+#install_learners("surv.svm")
+
+require(progressr)
+
+require(skimr)
+require(tidyverse)
+```
+
+
+
+# Load Data
+```{r}
+train_data <- readRDS("Data/train_data.Rds")
+```
+
+
+# Data Preprocessing of tasks
+
+## Setup tasks
+We will also need to set up tasks for our learner.
+
+```{r}
+tasks <- list()
+
+for(d in names(train_data)) {
+  
+  tasks[[d]] <- mlr3proba::TaskSurv$new(
+    id = d,
+    backend = train_data[[d]],
+    time = "time",
+    event = "status"
+  )
+  
+}
+```
+
+
+## Data Preprocessing
+
+Let´s setup some pipelines for data preprocessing.
+```{r}
+# PCA
+pca =
+  po("pca") %>>% po("filter",
+                    filter = mlr3filters::flt("variance"),
+                    filter.frac = 0.9)
+
+
+# Normalization 
+pos = po("scale")
+
+
+# Imputation
+impute =
+  po("imputemedian") %>>% po("imputesample")
+```
+
+
+Since there is no underlying distribution assumption in SVM, we should normalize all the datasets first. 
+
+Since there is no information about the underlying distribution of the data and the range might differ for each feature, let´s normalize the data. Since SVMs do not have any distributional assumptions, it makes sense to normalize all of the datasets. \http{https://towardsai.net/p/data-science/how-when-and-why-should-you-normalize-standardize-rescale-your-data-3f083def38ff}
+
+```{r}
+for(d in names(tasks)){
+  
+  tasks[[d]] <- pos$train(list(tasks[[d]]))[[1]]
+  
+}
+```
+
+
+
+### D1
+```{r}
+skimr::skim(tasks$d1$data())
+```
+
+V1 seems to be an ID variable, basically corresponding to the row names. Therefore it can be removed.
+
+```{r}
+tasks$d1$select(setdiff(tasks$d1$feature_names, "V1"))
+```
+
+
+### D2
+```{r}
+dim(tasks$d2$data())
+```
+
+Dataset 2 is high-dimensional with n<p. Therefore it would make sense to reduce the dimensionality a bit by feature selection. "FS can remove irrelevant and redundant features which may induce accidental correlations in learning algorithms, diminishing their generalization abilities. The use of FS is also known to decrease the risk of over-fitting in the algorithms used later. FS will also reduce the search space determined by the features, thus making the learning process faster and also less memory consuming." \http{https://bdataanalytics.biomedcentral.com/articles/10.1186/s41044-016-0014-0}
+
+```{r}
+tasks$d2 <- pca$train(tasks$d2)[[1]]
+
+dim(tasks$d2$data())
+```
+
+After dimensionality reduction, n>p.
+
+
+### D3
+```{r}
+skimr::skim(tasks$d3$data())
+```
+
+Dataset 3 has no dimensionality problem. Let´s check out how it performs on SVMs. Perhaps there is some collinearity or some "accidental correlation" in the data. Then we will consider pca. 
+
+
+### D4
+```{r}
+skimr::skim(tasks$d4$data())
+```
+
+
+### D5
+```{r}
+skimr::skim(tasks$d5$data())
+```
+
+Dataset 5 seems to contain a lot of categorical/binary data. Should not be a problem though. 
+
+
+### D7
+```{r}
+skimr::skim(tasks$d7$data())
+```
+
+The dataset 7 contains some missing values. Let´s not impute them yet. I want to check out how SVM is going to perform on this dataset. 
+
+It seems while training there is an intern problem with mlr3 framework and it tries to overwrite an object with less entries (omitted missing values).
+
+Therefore, let´s impute these missing values. First impute numerical values with the median. Then for the remaining factor variables impute a sample.
+```{r}
+tasks$d7 <- impute$train(tasks$d7)[[1]]
+```
+
+
+
+### D8
+```{r}
+skimr::skim(tasks$d8$data())
+```
+
+Very less data. V2 seems to be a binary variable. I hope that is no problem for normalization. We will think about that later. 
+
+
+### D9
+```{r}
+skimr::skim(tasks$d9$data())
+```
+
+Dataset 9 seems to contain some binary variables again. V5 and V6 look weird. We should check on that later. 
+
+
+# Base Learner 
+
+Let´s set up a base learner with the default settings. 
+
+```{r}
+svm <- ppl(
+    "distrcompositor",
+    mlr3::lrn("surv.svm"),
+    surv.svm.type = "vanbelle1",
+    surv.svm.gamma.mu = 0.1,
+    surv.svm.diff.meth = "makediff3",
+    surv.svm.opt.meth = "ipop",
+    graph_learner = TRUE
+  )
+```
+
+Conduct a benchmark anaylsis in order to get it automized.
+```{r}
+design <- benchmark_grid(
+  tasks = tasks, 
+  learner = svm, 
+  resamplings = rsmp("cv", folds = 5)
+)
+```
+
+```{r}
+base <- benchmark(design)
+saveRDS(base, "Data/base.RDS")
+```
+
+```{r}
+mlr3viz::autoplot(base, measure = IBS)
+mlr3viz::autoplot(base, measure = c_index)
+
+bmr$aggregate(c_index)
+bmr$aggregate(IBS)
+```
+
+Save base learner in RDS.
+```{r}
+Base_Learner <- list()
+
+for(d in names(tasks)){
+  
+  Base_Learner[[d]] <- bmr$learners$learner
+  
+}
+```
+
+```{r}
+saveRDS(Base_Learner, "Learner/Base_Learner.RDS")
+saveRDS(Base_Learner, "Learner/SM_2021-03-07.RDS")
+```
+
+
+
+
+# Setup Autotuner
+
+Now that the data preprocessing is done, let´s focus on setting up a Autotuner in order to get a descent learner for our data. 
+
+## Preliminary Settings
+
+Let´s first select a search algorithm. To keep this algorithm rather easy for now, let´s select random search. 
+Let´s choose the Stagnation method for termination. It will run until there is no improvement.
+
+```{r}
+random_tuner = mlr3tuning::tnr("random_search")
+terminator = mlr3tuning::trm("stagnation")
+```
+
+
+The performance measure according to which the learner will be tuned, is going to be the c-index.
+The evaluation metric will be the Integrated Brier score, also known as the Graf score.
+
+```{r}
+c_index <- mlr3::msr("surv.cindex")
+IBS <- mlr3::msr("surv.graf")
+```
+
+
+The resampling strategy is going to be k-fold cross-validation. Setting k=5. The number will be changes as soon as the working algorithm stands.
+```{r}
+rsmp_tuner = rsmp("cv", folds = 5)
+```
+
+
+## Setup Learner
+
+```{r}
+params = paradox::ParamSet$new(
+  list(
+    ParamDbl$new("surv.svm.gamma.mu", lower = 0L, upper = 5L, default = 0.1),
+    ParamDbl$new("surv.svm.margin", lower = 0L, upper = 1L),
+    ParamFct$new("surv.svm.kernel", levels = c("lin_kernel", "add_kernel", "rbf_kernel"))
+  )
+)
+```
+
+
+```{r}
+svm_tuner = mlr3tuning::AutoTuner$new(
+  learner      = ppl(
+    "distrcompositor",
+    mlr3::lrn("surv.svm"),
+    surv.svm.type = "vanbelle1",
+    surv.svm.gamma.mu = 0.1,
+    surv.svm.diff.meth = "makediff3",
+    surv.svm.opt.meth = "ipop",
+    graph_learner = TRUE
+  ),
+  resampling   = rsmp_tuner,
+  measure      = c_index,
+  search_space = params,
+  tuner        = random_tuner,
+  terminator   = terminator
+)
+```
+
+
+
+# Benchmark Analysis
+
+```{r}
+coxph <- mlr3::lrn("surv.coxph")
+kaplan <- mlr3::lrn("surv.kaplan")
+
+learners <- list(svm_tuner, coxph, kaplan)
+```
+
+
+
+```{r}
+rsmp_benchmark <- mlr3::rsmp("cv", folds = 5)
+
+grd = mlr3::benchmark_grid(
+  task = tasks,
+  learner = learners, 
+  resampling = rsmp_benchmark
+)
+```
+
+
+
+```{r, cache = TRUE, eval = FALSE}
+  future::plan("multisession", workers = 2)
+  progressr::with_progress(bmr <- benchmark(grd))
+  saveRDS(bmr, "Data/bmr.RDS")
+```
+
+
+
+# Results
+```{r}
+bmr$aggregate(c_index)
+bmr$aggregate(IBS)
+
+#pdf("IBS_d3.pdf")
+mlr3viz::autoplot(bmr, measure = IBS)
+mlr3viz::autoplot(bmr, measure = c_index)
+#dev.off()
+
+
+#bmr$resample_results$resample_result
+bmr$learners$learner
+```

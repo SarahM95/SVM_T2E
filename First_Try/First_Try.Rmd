@@ -111,7 +111,7 @@ Let´s start with regression:
 ```{r}
 # learner$param_set$values = list(type = "regression", gamma.mu = 0.1) das funktioniert nicht so richtig
 
-svm_regression = lrn("surv.svm", type = "regression", gamma.mu = 5, opt.meth = "ipop")
+svm_regression = lrn("surv.svm", type = "regression", gamma.mu = 0.1)
 ```
 
 
@@ -129,7 +129,7 @@ Training the learner
 ```{r}
 svm_regression$model
 
-svm_regression$train(task_d1, row_ids = train_set)
+svm_regression$train(tasks[["d1"]])
 
 print(svm_regression$model)
 ```

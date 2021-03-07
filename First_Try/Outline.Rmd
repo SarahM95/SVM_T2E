@@ -62,7 +62,7 @@ Check if problem exists in plain survivalsvm function
 svm_reg <-
   survivalsvm(
     formula = Surv(time, status) ~ .,
-    data = tasks[["d1"]],
+    data = train_data[["d7"]],
     type = "regression",
     gamma.mu = 0.1
   )
